@@ -94,6 +94,7 @@ class APIConnection:
         # Store whether connect() has completed
         # Used so that on_stop is _not_ called if an error occurs during connect()
         self._connect_complete = False
+        self._connecting = False
 
         # Message handlers currently subscribed to incoming messages
         self._message_handlers: List[Callable[[message.Message], None]] = []
@@ -116,33 +117,34 @@ class APIConnection:
 
         Safe to call multiple times.
         """
-        async def _do_cleanup():
-            async with self._connect_lock:
-                if self._frame_helper is not None:
-                    await self._frame_helper.close()
-                    self._frame_helper = None
+        async with self._connect_lock:
+            await self._cleanup_under_lock()
 
-                if self._process_task is not None:
-                    self._process_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await self._process_task
-                    self._process_task = None
+    async def _cleanup_under_lock(self) -> None:
+        """Clean up all resources that have been allocated while holding the connect lock."""
+        if self._frame_helper is not None:
+            await self._frame_helper.close()
+            self._frame_helper = None
 
-                if self._socket is not None:
-                    self._socket.close()
-                    self._socket = None
+        if self._process_task is not None:
+            self._process_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._process_task
+            self._process_task = None
 
-                if not self._on_stop_called and self._connect_complete:
-                    # Ensure on_stop is called
-                    asyncio.create_task(self.on_stop())
-                    self._on_stop_called = True
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
 
-                # Note: we don't explicitly cancel the ping/read task here
-                # That's because if not written right the ping/read task could cancel
-                # themself, effectively ending execution after _cleanup which may be unexpected
-                self._ping_stop_event.set()
+        if not self._on_stop_called and self._connect_complete:
+            # Ensure on_stop is called
+            asyncio.create_task(self.on_stop())
+            self._on_stop_called = True
 
-        asyncio.create_task(_do_cleanup())
+        # Note: we don't explicitly cancel the ping/read task here
+        # That's because if not written right the ping/read task could cancel
+        # themself, effectively ending execution after _cleanup which may be unexpected
+        self._ping_stop_event.set()
 
     async def _connect_resolve_host(self) -> hr.AddrInfo:
         """Step 1 in connect process: resolve the address."""
@@ -315,6 +317,8 @@ class APIConnection:
         # connect has succeeded but not yet returned, followed by a disconnect.
         # See esphome/aioesphomeapi#258 for more information
         async with self._connect_lock:
+            self._connecting = True
+
             try:
                 # Allow 2 minutes for connect; this is only as a last measure
                 # to protect from issues if some part of the connect process mistakenly
@@ -322,11 +326,12 @@ class APIConnection:
                 async with async_timeout.timeout(120.0):
                     await _do_connect()
             except Exception:  # pylint: disable=broad-except
-                # Always clean up the connection if an error occured during connect
+                # Always clean up the connection if an error occurred during connect
                 self._connection_state = ConnectionState.CLOSED
-                await self._cleanup()
+                await self._cleanup_under_lock()
                 raise
 
+            self._connecting = False
             self._connect_complete = True
 
     async def login(self) -> None:
@@ -491,7 +496,8 @@ class APIConnection:
         self._connection_state = ConnectionState.CLOSED
         for handler in self._read_exception_handlers[:]:
             handler(err)
-        await self._cleanup()
+        if not self._connecting:
+            await self._cleanup()
 
     async def _read_once(self) -> None:
         assert self._frame_helper is not None
