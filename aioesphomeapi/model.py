@@ -150,6 +150,7 @@ class BinarySensorState(EntityState):
 @dataclass(frozen=True)
 class CoverInfo(EntityInfo):
     assumed_state: bool = False
+    supports_stop: bool = False
     supports_position: bool = False
     supports_tilt: bool = False
     device_class: str = ""
@@ -172,7 +173,7 @@ class CoverOperation(APIIntEnum):
     IS_CLOSING = 2
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True) 
 class CoverState(EntityState):
     legacy_state: Optional[LegacyCoverState] = converter_field(
         default=LegacyCoverState.OPEN, converter=LegacyCoverState.convert
